@@ -1,0 +1,37 @@
+# 原始数据结构 (Raw Data)
+文件: plug_insert_fail_data.pkl
+格式: List[Dict] (列表套字典)
+规模: 2000 个 Step (共 20 条轨迹，每条 100 步)
+单个样本 (Step) 结构:
+  - observations: Dict
+    - side_policy: (1, 128, 128, 3) [uint8] - 侧视图像
+    - wrist_1:     (1, 128, 128, 3) [uint8] - 手腕图像1
+    - wrist_2:     (1, 128, 128, 3) [uint8] - 手腕图像2
+    - state:       (1, 19) [float32]        - 机器人状态
+  - actions: (7,) [float64] - 动作向量
+  - rewards: float          - 奖励值
+  - dones:   int            - 结束标志 (0或1)
+  - infos:   Dict           - 额外信息 (如 succeed, tcp_pose)
+
+---------------------------------------------------------
+
+# 转换后的 LeRobot 格式 (LeRobot Format)
+文件: plug_insert_fail_data_lerobot_format.pkl
+格式: Dict[str, np.ndarray] (字典套数组，列式存储)
+优势: 扁平化存储，支持 O(1) 索引访问，适合 PyTorch Dataset
+规模: 所有维度 N=2000
+字段映射:
+  - observation.state:              (2000, 19)
+  - observation.images.side_policy: (2000, 128, 128, 3) [去除了原始的batch维度]
+  - observation.images.wrist_1:     (2000, 128, 128, 3)
+  - observation.images.wrist_2:     (2000, 128, 128, 3)
+  - action:                         (2000, 7)
+  - next.reward:                    (2000,)
+  - next.done:                      (2000,)
+  - next.success:                   (2000,) [从 infos 提取]
+  
+  # 关键索引字段 (用于轨迹管理)
+  - episode_index: (2000,)  [int64] - 标识所属轨迹 ID (0-19)
+  - frame_index:   (2000,)  [int64] - 轨迹内的帧序号 (0-99)
+  - index:         (2000,)  [int64] - 全局数据索引
+

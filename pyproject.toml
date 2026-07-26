@@ -1,0 +1,71 @@
+[project]
+name = "reward-model"
+version = "0.1.0"
+description = "Automatic dense reward construction and visual reward models for robot manipulation"
+requires-python = ">=3.10"
+dependencies = [
+    # GPU wheels from PyTorch cu124 index (CUDA 12.4; matches typical 570-series drivers, not cu130).
+    "torch==2.6.0",
+    "torchvision==0.21.0",
+    "transformers>=4.36",
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+    "seaborn>=0.12",
+    "tqdm>=4.65",
+    "hmmlearn>=0.3",
+    "scikit-learn>=1.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.4",
+    "mypy>=1.8",
+    "pytest>=8.0",
+]
+# ManiSkill3: PyPI `mani-skill` 3.x (not 2.x). It pins a compatible `gymnasium`; do not override with gymnasium>=1.x here.
+sim = [
+    "tensorboard>=2.20.0",
+    "tyro>=1.0.13",
+    "mani-skill>=3.0.0b22,<4",
+]
+metaworld = [
+    "metaworld==3.1.1",
+    "gymnasium==1.3.0",
+    "mujoco==3.3.0",
+    "pillow>=10",
+]
+
+[tool.uv]
+# ManiSkill3 pre-1.0 releases live on beta tags; allow pre-releases for `mani-skill` 3.x.
+prerelease = "allow"
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "S", "B", "SIM"]
+ignore = ["S301", "S101", "E501"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+exclude = ["datasets/dp_data_collect_0322/"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["data", "label", "sim"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
