@@ -24,6 +24,21 @@ logger = logging.getLogger(__name__)
 DEFAULT_BACKBONE = "facebook/dinov2-small"
 
 
+def build_proprio_input_mask(
+    robot_dim: int,
+    state_windows: int,
+    masked_state_indices: list[int] | tuple[int, ...] | None = None,
+) -> torch.Tensor:
+    """Build a repeated binary mask for normalized proprioceptive inputs."""
+    indices = sorted(set(masked_state_indices or []))
+    if any(index < 0 or index >= robot_dim for index in indices):
+        raise ValueError(f"masked_state_indices must be within [0, {robot_dim}); got {indices}")
+    single_step = torch.ones(robot_dim)
+    if indices:
+        single_step[indices] = 0.0
+    return single_step.repeat(state_windows)
+
+
 class ProprioNormalizer(nn.Module):
     """Buffer-based normalizer for robot proprioceptive states.
 
@@ -201,6 +216,7 @@ class RewardModel(nn.Module):
         use_film: bool = False,
         use_gradient_checkpointing: bool = False,
         use_patch_pooling: bool = False,
+        masked_state_indices: list[int] | tuple[int, ...] | None = None,
     ):
         super().__init__()
 
@@ -215,10 +231,15 @@ class RewardModel(nn.Module):
         self.use_film = use_film
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.use_patch_pooling = use_patch_pooling
+        self.masked_state_indices = sorted(set(masked_state_indices or []))
 
         # Normalizers
         self.proprio_dim_flat = robot_dim * state_windows
         self.normalizer = ProprioNormalizer(self.proprio_dim_flat)
+        self.register_buffer(
+            "proprio_input_mask",
+            build_proprio_input_mask(robot_dim, state_windows, self.masked_state_indices),
+        )
         self.reward_normalizer = MinMaxNormalizer(min_val=min_reward, max_val=max_reward)
 
         if normalizer_stats is not None:
@@ -411,7 +432,7 @@ class RewardModel(nn.Module):
 
         Returns: [B, 512]
         """
-        proprio = self.normalizer(proprio)
+        proprio = self.normalizer(proprio) * self.proprio_input_mask
         vision_feat = self._encode_vision(images)
         proprio_feat = self.proprio_encoder(proprio)
 
@@ -502,7 +523,7 @@ class RewardModel(nn.Module):
             cam_results.append(self.temporal_adapter(cam_features[:, cam_idx]))
         vision_feat = torch.cat(cam_results, dim=1)
 
-        proprio_norm = self.normalizer(proprio)
+        proprio_norm = self.normalizer(proprio) * self.proprio_input_mask
         proprio_feat = self.proprio_encoder(proprio_norm)
 
         if self.film_generator is not None:
@@ -549,6 +570,7 @@ class RewardModel(nn.Module):
             "num_cameras": self.num_cameras,
             "use_film": self.use_film,
             "use_patch_pooling": self.use_patch_pooling,
+            "masked_state_indices": self.masked_state_indices,
             "action_dim": self.action_dim,
             "dropout": self.dropout,
             "unfreeze_last_n_layers": self.unfreeze_last_n_layers,
@@ -586,6 +608,7 @@ class RewardModel(nn.Module):
             num_cameras=config.get("num_cameras", 1),
             use_film=config.get("use_film", False),
             use_patch_pooling=config.get("use_patch_pooling", False),
+            masked_state_indices=config.get("masked_state_indices", []),
             dropout=config.get("dropout", 0.1),
             unfreeze_last_n_layers=config.get("unfreeze_last_n_layers", 0),
         )

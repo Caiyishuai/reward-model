@@ -29,8 +29,15 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-
-from metaworld_common import TASK_SPECS, get_task_spec, make_env, make_scripted_policy, render_rgb, success_from_info
+from metaworld_common import (
+    TASK_SPECS,
+    WristWrenchSensor,
+    get_task_spec,
+    make_env,
+    make_scripted_policy,
+    render_rgb,
+    success_from_info,
+)
 
 
 @dataclass
@@ -51,7 +58,13 @@ class CollectionMetadata:
     success_attempts: int
     fail_attempts: int
     state_dim: int
+    wrist_wrench_dim: int
+    policy_observation_dim: int
     action_dim: int
+    wrench_frame: str
+    wrench_filter_alpha: float
+    wrench_force_clip: float
+    wrench_torque_clip: float
 
 
 def _atomic_pickle(payload: object, path: Path) -> None:
@@ -72,6 +85,9 @@ def _rollout(
     image_size: int,
     max_episode_steps: int,
     reward_function_version: str,
+    wrench_filter_alpha: float,
+    wrench_force_clip: float,
+    wrench_torque_clip: float,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
     env = make_env(
         task,
@@ -81,6 +97,12 @@ def _rollout(
         reward_function_version=reward_function_version,
     )
     policy = make_scripted_policy(task)
+    wrench_sensor = WristWrenchSensor(
+        env,
+        filter_alpha=wrench_filter_alpha,
+        force_clip=wrench_force_clip,
+        torque_clip=wrench_torque_clip,
+    )
     rng = np.random.default_rng(seed)
     raw_steps: list[dict[str, Any]] = []
     serl_steps: list[dict[str, Any]] = []
@@ -89,6 +111,7 @@ def _rollout(
     try:
         observation, _ = env.reset(seed=seed)
         observation = np.asarray(observation, dtype=np.float32)
+        wrench_observation = wrench_sensor.reset()
 
         for frame in range(max_episode_steps):
             if scripted or failure_policy == "noisy-expert":
@@ -106,18 +129,27 @@ def _rollout(
             horizon = frame + 1 >= max_episode_steps
             done = bool(terminated or truncated or horizon or succeeded)
             image = render_rgb(env)
+            next_wrench_observation = wrench_sensor.read()
 
             raw_steps.append(
                 {
                     "observations": {
                         "state": next_observation.copy(),
                         "corner2": image,
+                        "wrist_wrench": next_wrench_observation.wrist_wrench.copy(),
                     },
-                    "previous_observations": {"state": observation.copy()},
+                    "previous_observations": {
+                        "state": observation.copy(),
+                        "wrist_wrench": wrench_observation.wrist_wrench.copy(),
+                    },
                     "actions": action.copy(),
                     "rewards": 0.0,
                     "env_rewards": np.float32(dense_reward),
                     "sparse_rewards": np.float32(succeeded),
+                    "contact_force": next_wrench_observation.contact_force.copy(),
+                    "wrist_wrench": next_wrench_observation.wrist_wrench.copy(),
+                    "max_contact_force": np.float32(next_wrench_observation.max_contact_force),
+                    "contact_count": int(next_wrench_observation.contact_count),
                     "dones": int(done),
                     "infos": {
                         "succeed": bool(succeeded and done),
@@ -125,10 +157,17 @@ def _rollout(
                     },
                 }
             )
+            policy_observation = np.concatenate([observation, wrench_observation.wrist_wrench]).astype(np.float32)
+            next_policy_observation = np.concatenate([next_observation, next_wrench_observation.wrist_wrench]).astype(
+                np.float32
+            )
             serl_steps.append(
                 {
-                    "observations": observation.copy(),
-                    "next_observations": next_observation.copy(),
+                    "observations": policy_observation,
+                    "next_observations": next_policy_observation,
+                    "wrist_wrench": wrench_observation.wrist_wrench.copy(),
+                    "next_wrist_wrench": next_wrench_observation.wrist_wrench.copy(),
+                    "max_contact_force": np.float32(next_wrench_observation.max_contact_force),
                     "actions": action.copy(),
                     "dense_rewards": np.float32(dense_reward),
                     "sparse_rewards": np.float32(succeeded),
@@ -137,6 +176,7 @@ def _rollout(
                 }
             )
             observation = next_observation
+            wrench_observation = next_wrench_observation
             if done:
                 break
     finally:
@@ -156,6 +196,9 @@ def _stack_serl(episodes: list[list[dict[str, Any]]], reward_key: str) -> dict[s
         "rewards": np.asarray([step[reward_key] for step in flat], dtype=np.float32),
         "masks": np.asarray([step["masks"] for step in flat], dtype=np.float32),
         "dones": np.asarray([step["dones"] for step in flat], dtype=bool),
+        "wrist_wrench": np.stack([step["wrist_wrench"] for step in flat]).astype(np.float32),
+        "next_wrist_wrench": np.stack([step["next_wrist_wrench"] for step in flat]).astype(np.float32),
+        "max_contact_force": np.asarray([step["max_contact_force"] for step in flat], dtype=np.float32),
     }
     episode_indices = []
     for episode_index, episode in enumerate(episodes):
@@ -186,6 +229,9 @@ def _collect_category(
             image_size=args.image_size,
             max_episode_steps=args.max_episode_steps,
             reward_function_version=args.reward_function_version,
+            wrench_filter_alpha=args.wrench_filter_alpha,
+            wrench_force_clip=args.wrench_force_clip,
+            wrench_torque_clip=args.wrench_torque_clip,
         )
         attempts += 1
         if succeeded != want_success:
@@ -197,8 +243,7 @@ def _collect_category(
     if len(raw_episodes) != target_count:
         label = "success" if want_success else "fail"
         raise RuntimeError(
-            f"{task}: collected {len(raw_episodes)}/{target_count} {label} episodes "
-            f"after {attempts} attempts"
+            f"{task}: collected {len(raw_episodes)}/{target_count} {label} episodes after {attempts} attempts"
         )
     return raw_episodes, serl_episodes, attempts
 
@@ -246,8 +291,14 @@ def collect_task(task: str, args: argparse.Namespace) -> None:
         seed=args.seed,
         success_attempts=success_attempts,
         fail_attempts=fail_attempts,
-        state_dim=int(sample["observations"].shape[0]),
+        state_dim=39,
+        wrist_wrench_dim=6,
+        policy_observation_dim=int(sample["observations"].shape[0]),
         action_dim=int(sample["actions"].shape[0]),
+        wrench_frame="endEffector",
+        wrench_filter_alpha=args.wrench_filter_alpha,
+        wrench_force_clip=args.wrench_force_clip,
+        wrench_torque_clip=args.wrench_torque_clip,
     )
     (output_dir / "collection_meta.json").write_text(json.dumps(asdict(metadata), indent=2))
     print(f"[OK] {task} -> {output_dir}")
@@ -272,6 +323,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--failure-policy", choices=["random", "noisy-expert"], default="random")
     parser.add_argument("--failure-noise-std", type=float, default=0.5)
     parser.add_argument("--reward-function-version", choices=["v1", "v2"], default="v2")
+    parser.add_argument("--wrench-filter-alpha", type=float, default=0.2)
+    parser.add_argument("--wrench-force-clip", type=float, default=100.0)
+    parser.add_argument("--wrench-torque-clip", type=float, default=10.0)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 

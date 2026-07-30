@@ -541,3 +541,61 @@ revision。
 - [ ] `maniskill_rm_quality.json` 无 failed task。
 - [ ] 环境、commit、seed、split、gamma 已记录。
 - [ ] 后续 policy utility 多种子矩阵已计划或完成。
+
+## 13. SERL normalized-dense 四任务实验
+
+这一组实验与 RM 数据集不同：每个任务只采集 **20 条成功 demo**，transition
+直接保存 ManiSkill `normalized_dense` 奖励，并使用 SERL visual DrQ/RLPD 在线
+训练。action 必须是 7-D `pd_ee_delta_pose`，相机必须同时有
+`base_camera` 和 `hand_camera`。
+
+先设置四个与环境、控制模式和机器人完全匹配的 PPO checkpoint：
+
+```bash
+export PUSHCUBE_CKPT=/path/to/pushcube_7d.pt
+export POKECUBE_CKPT=/path/to/pokecube_7d.pt
+export PLACESPHERE_CKPT=/path/to/placesphere_7d.pt
+export STACKCUBE_CKPT=/path/to/stackcube_7d.pt
+export MANISKILL_ROOT=/path/to/maniskill-ws
+
+bash scripts/run_maniskill_serl_demo_collection.sh
+```
+
+采集器固定使用单环境、`normalized_dense`、`panda_wristcam` 和
+`pd_ee_delta_pose`。完成后验证器必须报告四个数据集各 20 条 episode、7-D
+action、双相机以及 `[0,1]` reward。
+
+运行 fixed/adaptive τ 两组在线训练：
+
+```bash
+export SERL_ROOT=/path/to/serl
+# 必须指向同时安装了 CUDA PyTorch、JAX CUDA、ManiSkill 和 serl_launcher 的环境。
+export PYTHON_BIN=/path/to/combined-serl-maniskill-env/bin/python
+export ACTOR_STEPS=1000000
+export LEARNER_UPDATES=125000
+export TAU_MODES="fixed adaptive"
+
+bash scripts/run_maniskill_serl_dense_matrix.sh
+```
+
+训练入口使用 SERL 中较新的
+`examples/async_drq_sim/async_drq_sim_maniskill_ty.py`。运行时明确设置
+`--potential_reward_shaping=False`，因此在线奖励与 demo 都是原始
+`normalized_dense`，不是 `φ(s')-φ(s)`。如需论文 PBRS 对照，应作为另一组实验
+单独运行，不能与本组结果混报。
+
+外部 SERL 文件目前含有硬编码 W&B credential；本仓库的 sanitized launcher
+只在内存中删除该赋值，并把每轮评估写入 actor log：
+
+```text
+SERL_EVAL_JSON {"step": ..., "eval": {"success": ...}}
+```
+
+四任务完成后自动生成：
+
+```text
+runs/maniskill_serl_dense/summary.json
+```
+
+其中同时记录每组的 best 和 final episode success rate。默认每次评估 20 条
+trajectory；正式报告至少使用 3 个 seed，单 seed 的峰值不能作为论文结论。

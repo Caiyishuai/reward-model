@@ -51,6 +51,20 @@ def validate_file(path: str, category: str, minimum: int) -> dict:
                 errors.append(f"{prefix}: next state is not (39,)")
             if np.asarray(previous.get("state", [])).shape != (39,):
                 errors.append(f"{prefix}: previous state is not (39,)")
+            wrist_wrench = np.asarray(observation.get("wrist_wrench", []), dtype=np.float32)
+            previous_wrench = np.asarray(previous.get("wrist_wrench", []), dtype=np.float32)
+            if wrist_wrench.shape != (6,) or not np.isfinite(wrist_wrench).all():
+                errors.append(f"{prefix}: wrist_wrench must be finite (6,)")
+            if previous_wrench.shape != (6,) or not np.isfinite(previous_wrench).all():
+                errors.append(f"{prefix}: previous wrist_wrench must be finite (6,)")
+            if not np.array_equal(wrist_wrench, np.asarray(step.get("wrist_wrench", []))):
+                errors.append(f"{prefix}: top-level and observation wrist_wrench differ")
+            contact_force = np.asarray(step.get("contact_force", []), dtype=np.float32)
+            if contact_force.ndim != 2 or contact_force.shape[1:] != (3,) or not np.isfinite(contact_force).all():
+                errors.append(f"{prefix}: contact_force must be finite (N,3)")
+            max_contact_force = float(step.get("max_contact_force", np.nan))
+            if not np.isfinite(max_contact_force) or max_contact_force < 0.0:
+                errors.append(f"{prefix}: max_contact_force must be finite and non-negative")
             if np.asarray(step.get("actions", [])).shape != (4,):
                 errors.append(f"{prefix}: action is not (4,)")
             image = np.asarray(observation.get("corner2", []))

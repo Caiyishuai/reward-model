@@ -78,7 +78,9 @@ python -m pip install -e ".[dev]"
 
 Collect 20 successful scripted demonstrations and 20 random-policy failures per
 task. Each transition contains a 39-D goal-observable state, a 4-D action and
-`corner2` RGB.
+`corner2` RGB, plus a filtered virtual 6-D wrist wrench
+`[Fx,Fy,Fz,Tx,Ty,Tz]`. The SERL replay observation is therefore 45-D
+state+wrench.
 
 ```bash
 python scripts/collect_metaworld_rm_data.py \
@@ -99,8 +101,50 @@ Validate all datasets:
 python scripts/validate_metaworld_rm_data.py \
   --tasks all \
   --minimum-episodes 20 \
-  --output eval_results/metaworld_data_validation.json
+  --output eval_results/metaworld_force_data_validation.json
 ```
+
+Run sparse SERL with the learned force gate (eight tasks, fixed/adaptive tau):
+
+```bash
+export SERL_ROOT=/path/to/serl
+SEEDS="0 1 2" REWARD_MODES="sparse" TAU_MODES="fixed adaptive" \
+  bash scripts/run_metaworld_force_serl_matrix.sh
+```
+
+MetaWorld is not inherently visual-policy RL; the state-based integrations
+above remain available. A separate pixel DrQ path now uses three cameras and
+never exposes MetaWorld's 39-D goal-observable vector to the policy:
+
+```text
+state    (19,) robot-only float32
+wrist_1  (128,128,3) uint8 <- behindGripper
+wrist_2  (128,128,3) uint8 <- gripperPOV
+front    (128,128,3) uint8 <- corner2
+```
+
+The 19-D state is TCP world pose (xyz + intrinsic XYZ Euler), world linear and
+angular velocity, the six-axis wrist-frame wrench, and gripper-tip distance.
+Collect and validate exactly 20 successful demos per task, then run sparse
+visual DrQ:
+
+```bash
+python scripts/collect_metaworld_visual_demos.py --tasks all --output-root data
+python scripts/validate_metaworld_visual_demos.py --tasks all --data-root data
+
+export SERL_ROOT=/path/to/serl
+TAU_MODES="fixed adaptive" SEEDS="0 1 2" \
+  bash scripts/run_metaworld_visual_drq_matrix.sh
+```
+
+Defaults are sparse reward, EMA wrench filtering (`alpha=0.2`), learned sigmoid
+force gate, and `resnet-pretrained`; use `ENCODER_TYPE=small` for CPU smoke.
+Periodic deterministic evaluation defaults to 10 episodes every 10,000 steps,
+uses a separate visual-only environment, and writes `eval_success_rate` without
+inserting evaluation transitions into replay.
+When task goals are randomized but not visible in these views, the visual
+policy is partially observable. The trainer deliberately does not solve that
+risk by leaking goal/object state.
 
 Run automatic reward construction, train all eight visual RMs, evaluate held-out
 episodes and export auto/dense/sparse replay files:

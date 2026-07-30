@@ -179,9 +179,7 @@ class StageDiscovery:
         # Full covariance is fragile and cubic in feature count.  MetaWorld's
         # 39-D observation contains strongly correlated current/previous state
         # blocks; diagonal covariance is the stable production choice there.
-        self.covariance_type = (
-            "diag" if original_feature_count > 32 or training_data.shape[1] > 16 else "full"
-        )
+        self.covariance_type = "diag" if original_feature_count > 32 or training_data.shape[1] > 16 else "full"
         print(f"[HMM] Features={training_data.shape[1]}, covariance={self.covariance_type}")
 
         self.scaler = StandardScaler()
@@ -445,6 +443,7 @@ def compute_dense_reward(
     targets: list[StageTarget],
     state_sequence: np.ndarray,
     *,
+    force_gate_enabled: bool = True,
     check_gripper: bool = False,
     use_force_dynamics: bool = False,
     penalty_power: float = 1.0,
@@ -454,7 +453,11 @@ def compute_dense_reward(
 ) -> np.ndarray:
     """Compute per-step dense reward from HMM state sequence and stage targets.
 
-    Reward = stage_base + progress * force_mult * gripper_mult * time_mult
+    Reward = stage_base + progress * force_mult * gripper_mult * time_mult.
+
+    ``force_gate_enabled=False`` is the force-gate ablation: it fixes only
+    ``force_mult`` to 1.0 and bypasses both static-force and force-dynamics
+    matching. All other reward terms are unchanged.
     """
     states = np.array([x["observations"]["state"] for x in episode])
     if states.ndim > 2:
@@ -489,7 +492,7 @@ def compute_dense_reward(
         progress = np.exp(-0.5 * dist_mah)
 
         force_mult = 1.0
-        if tgt.is_contact and forces is not None:
+        if force_gate_enabled and tgt.is_contact and forces is not None:
             f_diff = forces[t] - tgt.force_mean
             f_dist = np.sqrt(np.clip(f_diff.T @ tgt.force_cov_inv @ f_diff, 0.0, None))
             force_match = np.exp(-0.5 * f_dist)
@@ -685,6 +688,8 @@ def export_lerobot(episodes: list[list[dict]], path: Path, camera_keys: list[str
     has_env_reward = any("env_rewards" in step for episode in episodes for step in episode)
     has_sparse_reward = any("sparse_rewards" in step for episode in episodes for step in episode)
     has_previous_state = any("previous_observations" in step for episode in episodes for step in episode)
+    has_wrist_wrench = any("wrist_wrench" in step.get("observations", {}) for episode in episodes for step in episode)
+    has_contact_force = any("contact_force" in step for episode in episodes for step in episode)
     converted: dict[str, list] = {
         "observation.state": [],
         "action": [],
@@ -701,6 +706,13 @@ def export_lerobot(episodes: list[list[dict]], path: Path, camera_keys: list[str
         converted["next.sparse_reward"] = []
     if has_previous_state:
         converted["previous_observation.state"] = []
+    if has_wrist_wrench:
+        converted["observation.wrist_wrench"] = []
+        converted["previous_observation.wrist_wrench"] = []
+        converted["next.max_contact_force"] = []
+        converted["next.contact_count"] = []
+    if has_contact_force:
+        converted["next.contact_force"] = []
     for k in camera_keys:
         converted[f"observation.images.{k}"] = []
 
@@ -723,6 +735,19 @@ def export_lerobot(episodes: list[list[dict]], path: Path, camera_keys: list[str
             if has_previous_state:
                 previous = step.get("previous_observations", {}).get("state", obs["state"])
                 converted["previous_observation.state"].append(np.asarray(previous).squeeze())
+            if has_wrist_wrench:
+                wrench = np.asarray(obs["wrist_wrench"], dtype=np.float32).squeeze()
+                previous_wrench = step.get("previous_observations", {}).get("wrist_wrench", wrench)
+                converted["observation.wrist_wrench"].append(wrench)
+                converted["previous_observation.wrist_wrench"].append(
+                    np.asarray(previous_wrench, dtype=np.float32).squeeze()
+                )
+                converted["next.max_contact_force"].append(float(step.get("max_contact_force", 0.0)))
+                converted["next.contact_count"].append(int(step.get("contact_count", 0)))
+            if has_contact_force:
+                converted["next.contact_force"].append(
+                    np.asarray(step.get("contact_force", np.zeros((0, 3))), dtype=np.float32)
+                )
             for k in camera_keys:
                 converted[f"observation.images.{k}"].append(obs[k].squeeze())
             idx += 1

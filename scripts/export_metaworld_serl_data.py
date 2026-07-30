@@ -16,7 +16,6 @@ if str(REPO_ROOT) not in sys.path:
 
 from data.common import BASE_DIR  # noqa: E402
 
-
 METAWORLD_TASKS = (
     "mw_button_press",
     "mw_window_open",
@@ -63,6 +62,10 @@ def export_task(task: str, prefix: str, reward_mode: str) -> Path:
     reward_column = REWARD_COLUMNS[reward_mode]
     for data, path in zip(datasets, paths, strict=True):
         _validate(data, reward_column, path)
+    wrench_presence = ["observation.wrist_wrench" in data for data in datasets]
+    if any(wrench_presence) and not all(wrench_presence):
+        raise ValueError(f"{task}: wrist wrench columns must exist in both success and fail datasets")
+    has_wrist_wrench = all(wrench_presence)
 
     columns: dict[str, list[np.ndarray]] = {
         "observations": [],
@@ -73,12 +76,26 @@ def export_task(task: str, prefix: str, reward_mode: str) -> Path:
         "dones": [],
         "episode_index": [],
     }
+    if has_wrist_wrench:
+        columns["wrist_wrench"] = []
+        columns["next_wrist_wrench"] = []
+        columns["max_contact_force"] = []
     episode_offset = 0
     for data in datasets:
         done = np.asarray(data["next.done"], dtype=bool)
         episode_ids = np.asarray(data["episode_index"], dtype=np.int32)
-        columns["observations"].append(np.asarray(data["previous_observation.state"], dtype=np.float32))
-        columns["next_observations"].append(np.asarray(data["observation.state"], dtype=np.float32))
+        observations = np.asarray(data["previous_observation.state"], dtype=np.float32)
+        next_observations = np.asarray(data["observation.state"], dtype=np.float32)
+        if has_wrist_wrench:
+            wrist_wrench = np.asarray(data["previous_observation.wrist_wrench"], dtype=np.float32)
+            next_wrist_wrench = np.asarray(data["observation.wrist_wrench"], dtype=np.float32)
+            observations = np.concatenate([observations, wrist_wrench], axis=1)
+            next_observations = np.concatenate([next_observations, next_wrist_wrench], axis=1)
+            columns["wrist_wrench"].append(wrist_wrench)
+            columns["next_wrist_wrench"].append(next_wrist_wrench)
+            columns["max_contact_force"].append(np.asarray(data["next.max_contact_force"], dtype=np.float32))
+        columns["observations"].append(observations)
+        columns["next_observations"].append(next_observations)
         columns["actions"].append(np.asarray(data["action"], dtype=np.float32))
         columns["rewards"].append(np.asarray(data[reward_column], dtype=np.float32))
         columns["masks"].append((~done).astype(np.float32))
@@ -87,9 +104,10 @@ def export_task(task: str, prefix: str, reward_mode: str) -> Path:
         episode_offset += int(episode_ids.max(initial=-1)) + 1
 
     stacked = {key: np.concatenate(parts, axis=0) for key, parts in columns.items()}
-    if stacked["observations"].shape[1] != 39 or stacked["actions"].shape[1] != 4:
+    expected_observation_dim = 45 if has_wrist_wrench else 39
+    if stacked["observations"].shape[1] != expected_observation_dim or stacked["actions"].shape[1] != 4:
         raise ValueError(
-            f"{task}: expected obs_dim=39/action_dim=4, got "
+            f"{task}: expected obs_dim={expected_observation_dim}/action_dim=4, got "
             f"{stacked['observations'].shape}/{stacked['actions'].shape}"
         )
 
@@ -100,7 +118,8 @@ def export_task(task: str, prefix: str, reward_mode: str) -> Path:
     temporary.replace(output)
     print(
         f"{task:20s} mode={reward_mode:6s} N={len(stacked['rewards']):6d} "
-        f"episodes={len(np.unique(stacked['episode_index'])):3d} -> {output}"
+        f"episodes={len(np.unique(stacked['episode_index'])):3d} "
+        f"obs_dim={expected_observation_dim} -> {output}"
     )
     return output
 
@@ -108,7 +127,9 @@ def export_task(task: str, prefix: str, reward_mode: str) -> Path:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export MetaWorld auto/dense/sparse rewards for SERL")
     parser.add_argument("--tasks", nargs="+", default=["all"])
-    parser.add_argument("--reward-modes", nargs="+", choices=sorted(REWARD_COLUMNS), default=["auto", "dense", "sparse"])
+    parser.add_argument(
+        "--reward-modes", nargs="+", choices=sorted(REWARD_COLUMNS), default=["auto", "dense", "sparse"]
+    )
     parser.add_argument("--prefix", default="auto")
     return parser.parse_args()
 

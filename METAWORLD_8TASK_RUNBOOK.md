@@ -30,11 +30,13 @@
 
 1. 八个环境 reset/step；
 2. 八个 scripted expert 均达到 `info["success"] == 1`；
-3. 八任务各 20 success + 20 fail RGB/state 采集并通过硬校验；
-4. 输出 reward-model raw pickle 和可选的 SERL stacked replay；
+3. 八任务各 20 success + 20 fail RGB/state/wrist-wrench 采集并通过硬校验；
+4. 输出 reward-model raw pickle 和 45-D state+wrench SERL stacked replay；
 5. 八任务 auto/dense/sparse × fixed/adaptive tau，共 48 个离线 SERL smoke run；
 6. 八任务 dense/sparse × fixed/adaptive tau，共 32 个在线 RLPD
    30-environment-step smoke run，均产生 checkpoint、`metrics.csv` 和运行配置。
+7. 八任务 sparse × fixed/adaptive tau 的 learned force-gate 路径，共 16 个
+   30-environment-step smoke run，均完成 15 次更新并保存 checkpoint。
 
 尚需 Linux/NVIDIA GPU 完成：
 
@@ -91,6 +93,9 @@ python scripts/collect_metaworld_rm_data.py \
   --image-size 128 \
   --failure-policy random \
   --reward-function-version v2 \
+  --wrench-filter-alpha 0.2 \
+  --wrench-force-clip 100 \
+  --wrench-torque-clip 10 \
   --seed 42
 ```
 
@@ -113,12 +118,27 @@ Reward-model raw transition：
 ```text
 observations.state             (39,) float32，执行 action 后的状态
 observations.corner2           (128,128,3) uint8
+observations.wrist_wrench       (6,) float32，[Fx,Fy,Fz,Tx,Ty,Tz]
 previous_observations.state    (39,) float32
+previous_observations.wrist_wrench (6,) float32
 actions                        (4,) float32
 env_rewards                    MetaWorld v2 dense reward
 sparse_rewards                 info["success"] 的 0/1
+contact_force                  (N_contact,3)，逐接触点世界系力
+max_contact_force              当前仿真步单接触点最大力范数
 dones                          episode 最后一帧为 1
 infos.succeed                  仅成功 episode 最后一帧为 True
+```
+
+`wrist_wrench` 不是 MetaWorld XML 中已有的 sensor（默认 `nsensor=0`）。采集器从
+MuJoCo 已求解 contact constraint 中提取每个外部接触力，将力矩平移到
+`endEffector` site，求和后旋转到腕部坐标系，并使用 EMA (`alpha=0.2`) 稳定信号。
+机器人端使用 `right_l6` 及其手和夹爪子树；内部机器人接触不会计入。
+
+`serl_dense.pkl` 和 `serl_sparse.pkl` 中的 policy observation 为：
+
+```text
+[MetaWorld goal-observable state (39), wrist_wrench (6)] = 45-D
 ```
 
 ## 4. 数据校验
@@ -323,7 +343,116 @@ checkpoints/agent_step_*.msgpack
 return、critic/actor loss 和当前 tau，可直接用于画与用户图片同口径的 success
 rate vs environment steps 曲线。
 
-## 8. 公平对比要求
+## 8. 力觉门控与视觉输入
+
+真机 `hil-serl` 的输入约定是 `tcp_force(3) + tcp_torque(3)`，由
+`SERLObsWrapper` 与其他 proprioception 一起展平。MetaWorld 对应实现：
+
+```text
+scripts/train_serl_metaworld_force.py
+scripts/run_metaworld_force_serl_matrix.sh
+```
+
+网络先按 `[30,30,30,3,3,3]` 缩放六维 wrench，再经 32-D force projection；
+另一个 learned sigmoid gate 根据 `state+wrench` 对 force feature 逐维门控，
+最后送入 actor/critic 各自的 MLP。原始 39-D state 不经过 gate，因此无接触或
+力信号不可靠时不会丢失基础状态信息。
+
+八任务 sparse、fixed/adaptive tau 正式矩阵：
+
+```bash
+cd /path/to/reward-model
+export SERL_ROOT=/path/to/serl
+export PYTHON_BIN="$SERL_ROOT/auto_research/venv_serl/bin/python"
+
+MAX_STEPS=1000000 \
+SEEDS="0 1 2" \
+REWARD_MODES="sparse" \
+TAU_MODES="fixed adaptive" \
+bash scripts/run_metaworld_force_serl_matrix.sh
+```
+
+MetaWorld 本身不强制 visual policy；上述两个 trainer 仍是 legacy state-based
+路径。新增的 visual DrQ 路径是独立实现：
+
+```text
+scripts/collect_metaworld_visual_demos.py
+scripts/validate_metaworld_visual_demos.py
+scripts/train_serl_metaworld_visual.py
+scripts/run_metaworld_visual_drq_matrix.sh
+```
+
+policy / replay 的稳定 dict schema：
+
+```text
+state    (19,) float32
+wrist_1  (128,128,3) uint8  <- behindGripper（hand body）
+wrist_2  (128,128,3) uint8  <- gripperPOV（hand body）
+front    (128,128,3) uint8  <- corner2
+```
+
+19-D robot-only state 精确定义：
+
+```text
+0:3    endEffector site 世界系 xyz（m）
+3:6    endEffector 姿态 intrinsic XYZ Euler / roll-pitch-yaw（rad）
+6:9    endEffector 世界系线速度 xyz（m/s）
+9:12   endEffector 世界系角速度 xyz（rad/s）
+12:18  endEffector 腕系 [Fx,Fy,Fz,Tx,Ty,Tz]（N, Nm）
+18     rightEndEffector 与 leftEndEffector site 世界系距离（m）
+```
+
+速度由 `mj_objectVelocity(..., mjOBJ_SITE, endEffector, local=0)` 获取，并从
+MuJoCo 的 angular-linear 顺序重排为 linear-angular。gripper state 只读取机器人
+tip site；整个构造不读取 object qpos、目标位置或 39-D goal-observable state。
+scripted policy 采集时仍接收官方 observation 以生成专家动作，但写入 demo 和在线
+policy 的 observation 只有上述 robot-only dict。
+
+采集与硬校验（每任务恰好 20 条成功 demo，不采失败轨迹）：
+
+```bash
+python scripts/collect_metaworld_visual_demos.py \
+  --tasks all --output-root data --num-demos 20 \
+  --image-size 128 --force-filter ema --wrench-filter-alpha 0.2
+
+python scripts/validate_metaworld_visual_demos.py \
+  --tasks all --data-root data --expected-episodes 20
+```
+
+每任务输出 `data/mw_<task>/visual_drq/success_demos.pkl.gz` 与
+`metadata.json`。pickle 是 stacked dict arrays，包含 observations、
+next_observations、actions、sparse rewards、masks、dones、episode index/step/
+seed。validator 检查 dtype/shape、终止边界、仅 terminal sparse reward、seed 与
+连续 transition 的三路图像/state 一致性。
+
+训练默认 sparse + `ema` + `learned_gate` + `resnet-pretrained`。force 可选
+`ema|none`，融合可选 `learned_gate|concat|none`；learned gate 位于 actor 和
+critic 共用的 DrQ encoder，参数路径和训练前后最大变化会写入 config/summary。
+MemoryEfficientReplayBuffer 运行时增加长度为 1 的 frame-stack 维度，磁盘 schema
+仍保持 HWC。
+
+```bash
+export SERL_ROOT=/path/to/serl
+MAX_STEPS=1000000 \
+SEEDS="0 1 2" \
+TAU_MODES="fixed adaptive" \
+EVAL_PERIOD=10000 \
+EVAL_EPISODES=10 \
+bash scripts/run_metaworld_visual_drq_matrix.sh
+```
+
+CPU smoke 使用 `ENCODER_TYPE=small`；正式 GPU 推荐默认
+`resnet-pretrained`。如果随机目标在三路图像中不可见，策略面对的是 POMDP；
+本实现不会通过泄漏 goal/object state 来规避该问题。
+
+visual trainer 的周期评估使用独立 MetaWorld env、相同三相机 robot-only wrapper
+和相同 wrench filter，以 deterministic (`argmax=True`) policy action rollout；
+评估 transition 不写入 online/demo replay。`metrics.csv` 的
+`train_success` 只在训练 episode 完成时填写，`eval_success_rate` 只在评估周期
+填写，避免 reset 后的 episode 状态覆盖真实结果。`--eval-period 0` 可显式关闭
+评估。
+
+## 9. 公平对比要求
 
 所有方法必须固定：
 
@@ -337,7 +466,7 @@ rate vs environment steps 曲线。
 
 评估始终使用 MetaWorld `info["success"]`，不能用 RM reward 判断成功。
 
-## 9. 运行记录模板
+## 10. 运行记录模板
 
 ```markdown
 # MetaWorld 8-task run
@@ -367,7 +496,7 @@ rate vs environment steps 曲线。
 | | dense/sparse/rm-pbrs | fixed/adaptive | | | | |
 ```
 
-## 10. 重要限制
+## 11. 重要限制
 
 - 本地 smoke 证明代码路径能运行，不证明收敛到图片结果。
 - MetaWorld 官方 scripted policy 只用于 demo，不能用于在线 eval。

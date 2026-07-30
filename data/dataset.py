@@ -15,8 +15,53 @@ from torchvision.transforms import RandomResizedCrop as _RandomResizedCrop
 from data.common import IMG_SIZE_RM, STATE_WINDOWS_DEFAULT, load_pickle
 
 
+FRAME_SPLIT_STRATEGIES = ("random", "temporal", "strided")
+
+
+def split_frame_end_indices(
+    indices: list[int],
+    split_ratio: float,
+    strategy: str,
+    seed: int,
+) -> tuple[list[int], list[int]]:
+    """Split one trajectory's candidate sample-ending frames into train/test.
+
+    The returned lists partition ``indices`` exactly.  ``random`` is the
+    default seeded permutation, ``temporal`` holds out the final frames, and
+    ``strided`` spreads held-out frames approximately uniformly over time.
+    """
+    if not 0.0 < split_ratio < 1.0:
+        raise ValueError(f"split_ratio must be in (0, 1); got {split_ratio}")
+    if strategy not in FRAME_SPLIT_STRATEGIES:
+        raise ValueError(
+            f"frame_split_strategy must be one of {FRAME_SPLIT_STRATEGIES}; got {strategy!r}"
+        )
+    if len(indices) < 2:
+        raise ValueError("each trajectory needs at least two candidate frame endpoints")
+
+    n_train = min(max(int(len(indices) * split_ratio), 1), len(indices) - 1)
+    ordered = np.asarray(indices, dtype=np.int64)
+    if strategy == "random":
+        permutation = np.random.default_rng(seed).permutation(len(ordered))
+        train_positions = set(permutation[:n_train].tolist())
+    elif strategy == "temporal":
+        train_positions = set(range(n_train))
+    else:
+        n_test = len(ordered) - n_train
+        test_positions = set(
+            np.floor((np.arange(n_test) + 0.5) * len(ordered) / n_test)
+            .astype(np.int64)
+            .tolist()
+        )
+        train_positions = set(range(len(ordered))) - test_positions
+
+    train = [int(value) for position, value in enumerate(ordered) if position in train_positions]
+    test = [int(value) for position, value in enumerate(ordered) if position not in train_positions]
+    return train, test
+
+
 class BalancedLeRobotDataset(Dataset):
-    """Episode-split balanced dataset with multi-camera support."""
+    """Balanced multi-camera dataset with episode- or within-episode splits."""
 
     def __init__(
         self,
@@ -34,6 +79,7 @@ class BalancedLeRobotDataset(Dataset):
         max_reward: float = 6.0,
         min_reward: float = 0.0,
         future_steps: int = 3,
+        frame_split_strategy: str | None = None,
     ):
         self.window_size = window_size
         self.future_steps = future_steps
@@ -45,6 +91,7 @@ class BalancedLeRobotDataset(Dataset):
         self.max_reward = max_reward
         self.min_reward = min_reward
         self.camera_keys = camera_keys
+        self.frame_split_strategy = frame_split_strategy
 
         self.num_success = int(epoch_size / (1 + target_ratio))
         self.num_fail = epoch_size - self.num_success
@@ -62,27 +109,48 @@ class BalancedLeRobotDataset(Dataset):
                 episode_indices = raw["episode_index"]
                 unique_eps = np.unique(episode_indices)
 
-                rng = np.random.default_rng(seed)
-                rng.shuffle(unique_eps)
-
-                split_idx = int(len(unique_eps) * split_ratio)
-                target_eps = unique_eps[:split_idx] if split == "train" else unique_eps[split_idx:]
-
-                if is_main:
-                    print(f"  {name}: {len(unique_eps)} eps total, {len(target_eps)} in {split}")
-
-                target_eps_set = set(target_eps)
                 rewards = raw["next.reward"]
                 valid_indices = []
+                if frame_split_strategy is None:
+                    rng = np.random.default_rng(seed)
+                    rng.shuffle(unique_eps)
+                    split_idx = int(len(unique_eps) * split_ratio)
+                    target_eps = unique_eps[:split_idx] if split == "train" else unique_eps[split_idx:]
+                    target_eps_set = set(target_eps)
+                    for i in range(window_size - 1, len(episode_indices)):
+                        if episode_indices[i] in target_eps_set:
+                            start = i - window_size + 1
+                            if episode_indices[start] == episode_indices[i]:
+                                valid_indices.append(i)
+                    split_description = f"{len(target_eps)} in {split}"
+                else:
+                    if split not in {"train", "val", "test"}:
+                        raise ValueError(f"frame-level splitting does not support split={split!r}")
+                    for episode_id in unique_eps:
+                        episode_candidates = np.flatnonzero(episode_indices == episode_id).tolist()
+                        episode_candidates = episode_candidates[window_size - 1 :]
+                        episode_seed = int(
+                            np.random.SeedSequence([seed, int(episode_id)]).generate_state(1)[0]
+                        )
+                        train_indices, test_indices = split_frame_end_indices(
+                            episode_candidates,
+                            split_ratio,
+                            frame_split_strategy,
+                            episode_seed,
+                        )
+                        valid_indices.extend(train_indices if split == "train" else test_indices)
+                    split_description = (
+                        f"all {len(unique_eps)} eps, {len(valid_indices)} {split} frame endpoints "
+                        f"({frame_split_strategy})"
+                    )
 
-                for i in range(window_size - 1, len(episode_indices)):
-                    if episode_indices[i] in target_eps_set:
-                        start = i - window_size + 1
-                        if episode_indices[start] == episode_indices[i]:
-                            valid_indices.append(i)
-                            r = rewards[i]
-                            self.reward_stats["min"] = min(self.reward_stats["min"], r)
-                            self.reward_stats["max"] = max(self.reward_stats["max"], r)
+                for i in valid_indices:
+                    r = rewards[i]
+                    self.reward_stats["min"] = min(self.reward_stats["min"], r)
+                    self.reward_stats["max"] = max(self.reward_stats["max"], r)
+
+                if is_main:
+                    print(f"  {name}: {len(unique_eps)} eps total, {split_description}")
 
                 self.data_store[name] = {"raw": raw, "valid_indices": valid_indices}
             else:
@@ -190,7 +258,14 @@ class BalancedLeRobotDataset(Dataset):
         ep_id = data["episode_index"][end_idx]
         future_idx = end_idx + self.future_steps
         max_idx = len(data["observation.state"]) - 1
-        if future_idx > max_idx or data["episode_index"][min(future_idx, max_idx)] != ep_id:
+        valid_index_set = self.data_store[cat].setdefault(
+            "valid_index_set", set(self.data_store[cat]["valid_indices"])
+        )
+        if (
+            future_idx > max_idx
+            or data["episode_index"][min(future_idx, max_idx)] != ep_id
+            or future_idx not in valid_index_set
+        ):
             future_idx = end_idx
         future_state = torch.from_numpy(data["observation.state"][future_idx]).float()
 

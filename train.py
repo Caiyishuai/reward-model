@@ -56,6 +56,7 @@ class TrainConfig:
     camera_keys: list[str] = field(default_factory=lambda: ["observation.images.wrist_1", "observation.images.wrist_2"])
 
     split_ratio: float = 0.9
+    frame_split_strategy: str | None = None
     fail_ratio: float = 1.0
     samples_per_epoch: int = 4000
 
@@ -86,6 +87,7 @@ class TrainConfig:
     use_film: bool = False
     use_gradient_checkpointing: bool = False
     use_patch_pooling: bool = False
+    masked_state_indices: list[int] = field(default_factory=list)
 
     ema_decay: float = 0.999
     use_ema: bool = True
@@ -97,6 +99,7 @@ class TrainConfig:
     use_amp: bool = True
     use_compile: bool = False
     compile_mode: str = "default"
+    run_post_train_eval: bool = True
 
 
 # ==========================================
@@ -114,6 +117,7 @@ def ranking_loss(rewards: Tensor, labels: Tensor, margin: float = 0.1) -> Tensor
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
@@ -229,6 +233,7 @@ def _train_inner(cfg: TrainConfig, device: torch.device) -> None:
         img_size=cfg.img_size,
         transform=AugmentationPipeline(cfg.img_size),
         seed=cfg.seed,
+        frame_split_strategy=cfg.frame_split_strategy,
     )
 
     cfg.min_reward = float(train_ds.reward_stats["min"])
@@ -267,6 +272,7 @@ def _train_inner(cfg: TrainConfig, device: torch.device) -> None:
         seed=cfg.seed,
         max_reward=cfg.max_reward,
         min_reward=cfg.min_reward,
+        frame_split_strategy=cfg.frame_split_strategy,
     )
     val_sampler = DistributedSampler(val_ds, shuffle=False) if cfg.local_rank != -1 else None
     val_loader = DataLoader(
@@ -297,6 +303,7 @@ def _train_inner(cfg: TrainConfig, device: torch.device) -> None:
         use_film=cfg.use_film,
         use_gradient_checkpointing=cfg.use_gradient_checkpointing,
         use_patch_pooling=cfg.use_patch_pooling,
+        masked_state_indices=cfg.masked_state_indices,
     ).to(device)
 
     if cfg.use_compile and hasattr(torch, "compile"):
@@ -502,7 +509,7 @@ def _train_inner(cfg: TrainConfig, device: torch.device) -> None:
                     print(f"[EarlyStop] No improvement for {cfg.early_stop_patience} evals. Stopping.")
                 break
 
-    if _is_main():
+    if _is_main() and cfg.run_post_train_eval:
         best_ckpt = ckpt_manager.best_checkpoint()
         if best_ckpt:
             print(f"\n[PostTrain] Running evaluation on best checkpoint: {best_ckpt}")
